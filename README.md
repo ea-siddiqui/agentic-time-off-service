@@ -1,6 +1,18 @@
 # ExampleHR Time-Off Microservice
 
-NestJS + TypeORM microservice for real-time time-off request validation, approval, and balance caching as specified in the TRD.
+A production-grade NestJS microservice that manages employee time-off requests while preserving strict synchronization with an external Human Capital Management (HCM) system.
+
+This project addresses a core distributed-systems challenge: maintaining local state that must remain consistent with a remote source of truth under concurrency, retries, and upstream failures.
+
+## Architectural Overview
+
+The central risk is balance drift. ExampleHR is not the only actor modifying HCM balances (for example, work anniversaries or policy refreshes), so a cached value can become stale at any time.
+
+To handle this, the service implements a **Cache-Aside with Real-time HCM Verification** pattern:
+
+- **Pessimistic verification on writes**: request submission and approval paths require live HCM balance verification.
+- **Defensive domain checks**: the service enforces arithmetic guards locally, even when upstream responses are incomplete.
+- **Dimensional precision**: balances are scoped by `employeeId`, `locationId`, and `leaveType`.
 
 ## Tech Stack
 
@@ -9,14 +21,33 @@ NestJS + TypeORM microservice for real-time time-off request validation, approva
 - **Database**: SQLite (`sqlite3`) with TypeORM (`typeorm`)
 - **Validation & Transformation**: `class-validator`, `class-transformer`
 - **Testing**: Jest (`jest`, `ts-jest`) and Supertest (`supertest`)
-- **Concurrency Control**: In-process per-employee async lock implemented in `TimeOffService` (`Map<string, Promise<void>>`)
-- **Resilience Control**: In-process circuit breaker implemented in `HcmAdapterService` (`CLOSED` / `OPEN` / `HALF_OPEN`, timeout + failure threshold)
+- **Concurrency Control**: in-process per-employee serialized async lock in `TimeOffService` (`Map<string, Promise<void>>`)
+- **Resilience Control**: in-process circuit breaker in `HcmAdapterService` (`CLOSED` / `OPEN` / `HALF_OPEN`, timeout + failure threshold)
 
-## Key Features
+## Key Engineering Controls
 
-- **Resilience (Circuit Breaker)**: Outbound HCM calls are wrapped with circuit-breaker logic (`CLOSED` / `OPEN` / `HALF_OPEN`) to fail fast during upstream outages and protect service latency.
-- **Reliability (Idempotency)**: Request submission is guarded by `idempotencyKey` so client retries return the same result without creating duplicate requests or duplicate upstream side effects.
-- **Concurrency (Per-Employee Serialized Locks)**: Critical submit flow is serialized per `employeeId` to prevent race conditions where concurrent requests oversubscribe available leave.
+### 1) Resilience (Circuit Breaker)
+
+Outbound HCM calls are protected by a circuit breaker to prevent cascading failures.  
+When the upstream is unstable, the service fails fast with predictable behavior rather than degrading into long tail-latency.
+
+### 2) Concurrency (Per-Employee Serialized Locks)
+
+The `submitRequest` verify-then-commit flow is serialized per `employeeId`.  
+This prevents race conditions where concurrent requests can over-allocate the same leave balance window.
+
+### 3) Reliability (Idempotency)
+
+Submission is guarded by `idempotencyKey`.  
+If clients retry the same request, the existing result is replayed and duplicate side effects are avoided.
+
+### 4) Integration Testing (Mock HCM)
+
+The repository includes a built-in Mock HCM controller used by integration/e2e tests to simulate:
+
+- normal balance responses
+- low-balance conditions
+- forced 500 errors for resilience-path verification
 
 ## How to Run
 
@@ -24,24 +55,20 @@ NestJS + TypeORM microservice for real-time time-off request validation, approva
 - `npm run build` (Compile TypeScript)
 - `npm run test` (Run the full test suite)
 
-## Architectural Note
+Optional local runtime:
 
-This service follows a **Cache-Aside with Real-time HCM Verification** pattern from the TRD:
+- `npm run start:dev` (Start the microservice locally)
 
-- `BalanceCache` is used for low-latency reads and optimistic pre-checks.
-- `submitRequest` and approval paths still perform live HCM verification before mutating request state.
-- Cache entries are refreshed from verified HCM values to keep local data useful while preserving external source-of-truth guarantees.
+## Methodology
 
-The production integrity model is intentionally built on three controls that work together:
+This codebase was delivered using an **agentic development workflow**:
 
-- **Circuit Breaker** to prevent cascading failures when HCM is unstable.
-- **Idempotency** to guarantee safe client retry behavior.
-- **Per-Employee Serialized Locks** to prevent concurrent oversubscription during verify-then-commit flows.
+- **Architecture-first**: the TRD defines invariants, flow contracts, and failure handling rules.
+- **Implementation-through-constraints**: services, entities, and controllers are generated and iterated against those constraints.
+- **Validation-driven quality**: integration and e2e tests are used to confirm resilience, concurrency, and idempotency behavior end-to-end.
 
-## Project Structure (Key Areas)
+## Deliverables Included
 
-- `src/hcm-adapter/` - upstream HCM integration and circuit-breaker behavior
-- `src/time-off/` - request submission, approval, idempotency, and lock orchestration
-- `src/mock-hcm/` - deterministic mock upstream endpoints for resilience and integration testing
-- `src/entities/` - TypeORM entities for requests, employees, cache, and idempotency
-- `test/` - e2e and integration test suites
+- Complete microservice implementation (`NestJS + TypeORM + SQLite`)
+- `TimeOff_Microservice_TRD.md` with architecture and requirements
+- Integration and e2e test suite with mock upstream behavior
